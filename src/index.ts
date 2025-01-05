@@ -2,10 +2,22 @@
 import axios from 'axios';
 import { createInterface } from 'readline';
 
-interface WordPressConfig {
-  siteUrl: string;
-  username: string;
-  password: string;
+interface JsonRpcRequest {
+  jsonrpc: '2.0';
+  id: string | number;
+  method: string;
+  params?: any;
+}
+
+interface JsonRpcResponse {
+  jsonrpc: '2.0';
+  id: string | number;
+  result?: any;
+  error?: {
+    code: number;
+    message: string;
+    data?: any;
+  };
 }
 
 interface WordPressError {
@@ -27,100 +39,76 @@ const isAxiosError = (error: unknown): error is AxiosError => {
          (error as any).response !== undefined;
 };
 
-interface WordPressRequest {
-  tool: 'create_post' | 'get_posts' | 'update_post';
-  siteUrl: string;
-  username: string;
-  password: string;
-  title?: string;
-  content?: string;
-  status?: 'draft' | 'publish' | 'private';
-  postId?: number;
-  perPage?: number;
-  page?: number;
-}
+// Get WordPress credentials from environment variables
+const DEFAULT_SITE_URL = process.env.WORDPRESS_SITE_URL || '';
+const DEFAULT_USERNAME = process.env.WORDPRESS_USERNAME || '';
+const DEFAULT_PASSWORD = process.env.WORDPRESS_PASSWORD || '';
 
-async function handleWordPressRequest(request: WordPressRequest) {
+async function handleWordPressRequest(method: string, params: any): Promise<any> {
   try {
-    const auth = Buffer.from(`${request.username}:${request.password}`).toString('base64');
+    const siteUrl = params.siteUrl || DEFAULT_SITE_URL;
+    const username = params.username || DEFAULT_USERNAME;
+    const password = params.password || DEFAULT_PASSWORD;
+
+    if (!siteUrl || !username || !password) {
+      throw new Error('WordPress credentials not provided in environment variables or request parameters');
+    }
+
+    const auth = Buffer.from(`${username}:${password}`).toString('base64');
     const client = axios.create({
-      baseURL: `${request.siteUrl}/wp-json/wp/v2`,
+      baseURL: `${siteUrl}/wp-json/wp/v2`,
       headers: {
         Authorization: `Basic ${auth}`,
         'Content-Type': 'application/json',
       },
     });
 
-    switch (request.tool) {
+    switch (method) {
       case 'create_post':
-        if (!request.title || !request.content) {
-          return {
-            success: false,
-            error: 'Title and content are required for creating a post',
-          };
+        if (!params.title || !params.content) {
+          throw new Error('Title and content are required for creating a post');
         }
         const createResponse = await client.post('/posts', {
-          title: request.title,
-          content: request.content,
-          status: request.status || 'draft',
+          title: params.title,
+          content: params.content,
+          status: params.status || 'draft',
         });
-        return {
-          success: true,
-          data: createResponse.data,
-        };
+        return createResponse.data;
 
       case 'get_posts':
         const getResponse = await client.get('/posts', {
           params: {
-            per_page: request.perPage || 10,
-            page: request.page || 1,
+            per_page: params.perPage || 10,
+            page: params.page || 1,
           },
         });
-        return {
-          success: true,
-          data: getResponse.data,
-        };
+        return getResponse.data;
 
       case 'update_post':
-        if (!request.postId) {
-          return {
-            success: false,
-            error: 'Post ID is required for updating a post',
-          };
+        if (!params.postId) {
+          throw new Error('Post ID is required for updating a post');
         }
         const updateData: Record<string, any> = {};
-        if (request.title) updateData.title = request.title;
-        if (request.content) updateData.content = request.content;
-        if (request.status) updateData.status = request.status;
+        if (params.title) updateData.title = params.title;
+        if (params.content) updateData.content = params.content;
+        if (params.status) updateData.status = params.status;
 
         const updateResponse = await client.post(
-          `/posts/${request.postId}`,
+          `/posts/${params.postId}`,
           updateData
         );
-        return {
-          success: true,
-          data: updateResponse.data,
-        };
+        return updateResponse.data;
 
       default:
-        return {
-          success: false,
-          error: `Unknown tool: ${request.tool}`,
-        };
+        throw new Error(`Unknown method: ${method}`);
     }
   } catch (error: unknown) {
     if (isAxiosError(error)) {
-      return {
-        success: false,
-        error: `WordPress API error: ${
-          error.response?.data?.message || error.message
-        }`,
-      };
+      throw new Error(`WordPress API error: ${
+        error.response?.data?.message || error.message
+      }`);
     }
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
+    throw error;
   }
 }
 
@@ -131,14 +119,40 @@ const rl = createInterface({
 });
 
 rl.on('line', async (line) => {
+  let request: JsonRpcRequest;
   try {
-    const request = JSON.parse(line) as WordPressRequest;
-    const result = await handleWordPressRequest(request);
-    console.log(JSON.stringify(result));
-  } catch (error: unknown) {
+    request = JSON.parse(line);
+    if (request.jsonrpc !== '2.0') {
+      throw new Error('Invalid JSON-RPC version');
+    }
+  } catch (error) {
     console.log(JSON.stringify({
-      success: false,
-      error: error instanceof Error ? error.message : String(error),
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: -32700,
+        message: 'Parse error',
+        data: error instanceof Error ? error.message : String(error)
+      }
+    }));
+    return;
+  }
+
+  try {
+    const result = await handleWordPressRequest(request.method, request.params);
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      id: request.id,
+      result
+    }));
+  } catch (error) {
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      id: request.id,
+      error: {
+        code: -32000,
+        message: error instanceof Error ? error.message : String(error)
+      }
     }));
   }
 });
@@ -148,4 +162,4 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-console.error('WordPress server running on stdin/stdout');
+console.error('WordPress MCP server running on stdin/stdout');
